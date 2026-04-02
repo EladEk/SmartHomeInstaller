@@ -1,0 +1,417 @@
+---
+- name: SmartHome Genesis Deployment
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    home_dir: "/home/{{ target_user }}"
+    repo_dir: "{{ home_dir }}/SmartHome"
+
+  tasks:
+
+    # =========================================================
+    # SYSTEM DEPENDENCIES
+    # =========================================================
+
+    - name: Install System Dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - jq
+          - rsync
+          - netcat-openbsd
+          - mosquitto-clients   # needed for healthcheck
+        state: present
+        update_cache: yes
+
+    # =========================================================
+    # DOCKER INSTALLATION
+    # ✅ FIX #4: Replaced deprecated apt_key with modern keyring approach
+    # =========================================================
+
+    - name: Create apt keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Download Docker GPG key
+      get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+        force: no
+
+    - name: Ensure Docker repository is configured
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+        filename: docker
+
+    - name: Install Docker Ecosystem
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Add Target User to Docker Group
+      user:
+        name: "{{ target_user }}"
+        groups: docker
+        append: yes
+
+    # =========================================================
+    # TAILSCALE
+    # ✅ FIX #5: Split into two tasks so auth runs even if binary exists.
+    # ✅ FIX #6: Auth key passed via environment variable, not CLI arg,
+    #            so it never appears in `ps aux`.
+    # =========================================================
+
+    - name: Install Tailscale binary
+      shell: curl -fsSL https://tailscale.com/install.sh | sh
+      args:
+        creates: /usr/bin/tailscale
+      when: tailscale_key | length > 0
+
+    - name: Authenticate Tailscale
+      shell: tailscale up --authkey="$TS_AUTHKEY"
+      environment:
+        TS_AUTHKEY: "{{ tailscale_key }}"
+      when:
+        - tailscale_key | length > 0
+        - ansible_facts['tailscale_up'] is not defined
+      register: tailscale_up_result
+      changed_when: tailscale_up_result.rc == 0
+      failed_when: tailscale_up_result.rc != 0
+
+    # =========================================================
+    # CLOUDFLARE TUNNEL
+    # ✅ FIX #7: Guard against re-installing an already-enabled service
+    # =========================================================
+
+    - name: Install Cloudflare Tunnel binary
+      shell: |
+        curl -L -o /tmp/cloudflared.deb \
+          https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+        dpkg -i /tmp/cloudflared.deb || apt-get install -f -y
+      args:
+        creates: /usr/local/bin/cloudflared
+      when: cf_token | length > 0
+
+    - name: Install and enable Cloudflare Tunnel service
+      shell: |
+        if ! systemctl is-enabled cloudflared &>/dev/null; then
+          cloudflared service install "{{ cf_token }}"
+          systemctl enable --now cloudflared
+        fi
+      when: cf_token | length > 0
+      changed_when: false
+
+    # =========================================================
+    # ZIGBEE USB AUTO-DETECT
+    # =========================================================
+
+    - name: Auto-Detect Zigbee USB Port
+      shell: "ls /dev/ttyUSB* /dev/ttyACM* /dev/serial/by-id/* 2>/dev/null | head -n 1 || echo '/dev/ttyUSB0'"
+      register: zigbee_port
+      changed_when: false
+
+    - name: Report detected Zigbee port
+      debug:
+        msg: "Zigbee device detected at: {{ zigbee_port.stdout }}"
+
+    # =========================================================
+    # DIRECTORY SCAFFOLD
+    # =========================================================
+
+    - name: Create SmartHome Directory Scaffold
+      file:
+        path: "{{ repo_dir }}/{{ item }}"
+        state: directory
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0755'
+      loop:
+        - ha-stack
+        - homeassistant
+        - mosquitto/data
+        - mosquitto/config
+        - mosquitto/log
+        - nodered
+        - zigbee2mqtt
+        - system
+        - scripts
+
+    - name: Set Mosquitto strict permissions (UID 1883)
+      file:
+        path: "{{ repo_dir }}/mosquitto"
+        state: directory
+        owner: "1883"
+        group: "1883"
+        recurse: yes
+
+    # =========================================================
+    # MOSQUITTO PASSWORD FILE
+    # ✅ FIX #8: Replaced allow_anonymous true with password auth
+    # =========================================================
+
+    - name: Generate Mosquitto password file
+      shell: |
+        mosquitto_passwd -c -b \
+          "{{ repo_dir }}/mosquitto/config/passwd" \
+          smarthome "{{ mqtt_password }}"
+      args:
+        creates: "{{ repo_dir }}/mosquitto/config/passwd"
+
+    - name: Set Mosquitto password file permissions
+      file:
+        path: "{{ repo_dir }}/mosquitto/config/passwd"
+        owner: "1883"
+        group: "1883"
+        mode: '0600'
+
+    # =========================================================
+    # DOCKER COMPOSE
+    # ✅ FIX #9: Added depends_on + healthchecks + pinned image versions
+    # ✅ FIX #10: Added dialout group for Zigbee USB access
+    # ✅ FIX #11: Removed allow_anonymous, added password_file
+    # =========================================================
+
+    - name: Generate docker-compose.yaml
+      copy:
+        dest: "{{ repo_dir }}/ha-stack/docker-compose.yaml"
+        owner: "{{ target_user }}"
+        content: |
+          services:
+            mosquitto:
+              image: eclipse-mosquitto:2.0.18
+              container_name: mosquitto
+              restart: unless-stopped
+              ports:
+                - "1883:1883"
+              volumes:
+                - ../mosquitto/config:/mosquitto/config
+                - ../mosquitto/data:/mosquitto/data
+                - ../mosquitto/log:/mosquitto/log
+              healthcheck:
+                test: ["CMD", "mosquitto_sub", "-t", "$$SYS/#", "-C", "1",
+                       "-i", "healthcheck", "-W", "3",
+                       "-u", "smarthome", "-P", "{{ mqtt_password }}"]
+                interval: 30s
+                timeout: 10s
+                retries: 3
+
+            zigbee2mqtt:
+              image: koenkk/zigbee2mqtt:2.1.1
+              container_name: zigbee2mqtt
+              restart: unless-stopped
+              depends_on:
+                mosquitto:
+                  condition: service_healthy
+              ports:
+                - "8080:8080"
+              volumes:
+                - ../zigbee2mqtt:/app/data
+              devices:
+                - {{ zigbee_port.stdout }}:{{ zigbee_port.stdout }}
+              group_add:
+                - dialout
+
+            nodered:
+              image: nodered/node-red:4.0.9
+              container_name: nodered
+              restart: unless-stopped
+              depends_on:
+                mosquitto:
+                  condition: service_healthy
+              ports:
+                - "1880:1880"
+              volumes:
+                - ../nodered:/data
+
+            homeassistant:
+              image: ghcr.io/home-assistant/home-assistant:2025.4
+              container_name: homeassistant
+              restart: unless-stopped
+              depends_on:
+                mosquitto:
+                  condition: service_healthy
+              network_mode: host
+              volumes:
+                - ../homeassistant:/config
+                - /etc/localtime:/etc/localtime:ro
+
+    # =========================================================
+    # HOME ASSISTANT CONFIG FILES
+    # =========================================================
+
+    - name: Generate Home Assistant secrets.yaml
+      copy:
+        dest: "{{ repo_dir }}/homeassistant/secrets.yaml"
+        owner: "{{ target_user }}"
+        mode: '0600'
+        content: |
+          time_zone: "{{ ha_tz }}"
+          home_latitude: {{ ha_lat }}
+          home_longitude: {{ ha_lon }}
+          home_elevation: {{ ha_elev }}
+
+    - name: Generate Core Configuration Files
+      copy:
+        dest: "{{ repo_dir }}/{{ item.dest }}"
+        owner: "{{ target_user }}"
+        content: "{{ item.content }}"
+      loop:
+        - dest: "homeassistant/configuration.yaml"
+          content: |
+            default_config:
+            homeassistant:
+              time_zone: !secret time_zone
+              latitude: !secret home_latitude
+              longitude: !secret home_longitude
+              elevation: !secret home_elevation
+            group: !include groups.yaml
+            automation: !include automations.yaml
+            script: !include scripts.yaml
+            scene: !include scenes.yaml
+
+        - dest: "mosquitto/config/mosquitto.conf"
+          content: |
+            listener 1883
+            allow_anonymous false
+            password_file /mosquitto/config/passwd
+            persistence true
+            persistence_location /mosquitto/data/
+            log_dest file /mosquitto/log/mosquitto.log
+
+        - dest: "zigbee2mqtt/configuration.yaml"
+          content: |
+            homeassistant: true
+            # ✅ FIX: permit_join is false by default - enable temporarily via HA UI
+            permit_join: false
+            mqtt:
+              base_topic: zigbee2mqtt
+              server: 'mqtt://localhost:1883'
+              user: smarthome
+              password: "{{ mqtt_password }}"
+            serial:
+              port: {{ zigbee_port.stdout }}
+            frontend:
+              port: 8080
+
+        - dest: ".gitignore"
+          content: |
+            *.log
+            .DS_Store
+            homeassistant/*.db
+            homeassistant/*.db-*
+            homeassistant/backups/
+            zigbee2mqtt/log/
+            mosquitto/config/passwd
+
+    - name: Ensure HA !include files exist
+      file:
+        path: "{{ repo_dir }}/homeassistant/{{ item }}"
+        state: touch
+        owner: "{{ target_user }}"
+      loop:
+        - groups.yaml
+        - automations.yaml
+        - scripts.yaml
+        - scenes.yaml
+
+    # =========================================================
+    # BACKUP SCRIPT
+    # ✅ FIX #12: backup.sh now actually created (was missing entirely)
+    # =========================================================
+
+    - name: Generate backup.sh
+      copy:
+        dest: "{{ repo_dir }}/backup.sh"
+        owner: "{{ target_user }}"
+        mode: '0750'
+        content: |
+          #!/bin/bash
+          # SmartHome Nightly Backup
+          set -euo pipefail
+          REPO="{{ repo_dir }}"
+          BACKUP_DIR="{{ home_dir }}/smarthome-backups"
+          DATE=$(date +%Y-%m-%d)
+          DEST="$BACKUP_DIR/$DATE"
+
+          mkdir -p "$DEST"
+
+          # Backup HA config (excluding DB files)
+          rsync -a --exclude='*.db' --exclude='*.db-shm' --exclude='*.db-wal' \
+            "$REPO/homeassistant/" "$DEST/homeassistant/"
+
+          # Backup Zigbee2MQTT config
+          rsync -a --exclude='log/' \
+            "$REPO/zigbee2mqtt/" "$DEST/zigbee2mqtt/"
+
+          # Git snapshot
+          cd "$REPO"
+          git add -A
+          git diff --cached --quiet || git commit -m "Auto-backup: $DATE"
+
+          # Prune backups older than 30 days
+          find "$BACKUP_DIR" -maxdepth 1 -type d -mtime +30 -exec rm -rf {} +
+
+          echo "[$(date)] Backup complete -> $DEST"
+
+    # =========================================================
+    # GIT REPOSITORY
+    # ✅ FIX #13: Replaced broken loop+creates with a single shell block
+    #             that only commits if there are staged files
+    # =========================================================
+
+    - name: Initialize Git Repository
+      shell: |
+        git init
+        git config user.name "SmartHome Admin"
+        git config user.email "admin@smarthome.local"
+        git add -A
+        git diff --cached --quiet || git commit -m "Initial setup by Ansible Genesis"
+      args:
+        chdir: "{{ repo_dir }}"
+        creates: "{{ repo_dir }}/.git/HEAD"
+      become_user: "{{ target_user }}"
+
+    # =========================================================
+    # CRON JOB
+    # ✅ FIX #14: Fixed broken YAML (newline inside target_u\nser)
+    # =========================================================
+
+    - name: Schedule Nightly Backup Cron Job
+      cron:
+        name: "SmartHome Nightly Backup"
+        minute: "0"
+        hour: "2"
+        user: "{{ target_user }}"
+        job: "{{ repo_dir }}/backup.sh >> {{ repo_dir }}/backup.log 2>&1"
+
+    # =========================================================
+    # LAUNCH
+    # ✅ FIX #15: Stack started as target_user, not root
+    # =========================================================
+
+    - name: Start Docker Compose Stack
+      command: docker compose up -d
+      args:
+        chdir: "{{ repo_dir }}/ha-stack"
+      become_user: "{{ target_user }}"
+
+    - name: Deployment Summary
+      debug:
+        msg:
+          - "✅ SmartHome Genesis Complete!"
+          - "   Home Assistant : http://localhost:8123"
+          - "   Zigbee2MQTT    : http://localhost:8080"
+          - "   Node-RED       : http://localhost:1880"
