@@ -26,7 +26,7 @@ echo "Target User: $TARGET_USER"
 # --- 1. Install Ansible (Prerequisite) ---
 echo -e "\n>>> Installing Ansible Engine..."
 apt-get update -yqq
-apt-get install -yqq software-properties-common ansible curl git
+apt-get install -yqq software-properties-common ansible curl git openssl
 
 # --- Validation Helpers ---
 # ✅ FIX #2: Validate numeric inputs before proceeding
@@ -49,7 +49,7 @@ validate_int() {
 }
 
 # --- 2. The Interview ---
-clear
+echo ""
 echo "==========================================================="
 echo "   STEP 1: TAILSCALE VPN AUTHENTICATION"
 echo "==========================================================="
@@ -95,19 +95,29 @@ MQTT_PASSWORD="$(openssl rand -hex 16)"
 
 # --- 4. Generate Ansible Variables File ---
 echo ">>> Securing variables..."
-cat <<EOF > "$VARS_FILE"
-target_user: "$TARGET_USER"
-tailscale_key: "$TS_KEY"
-cf_token: "$CF_TOKEN"
-ha_tz: "$HA_TZ"
-ha_lat: "$HA_LAT"
-ha_lon: "$HA_LON"
-ha_elev: "$HA_ELEV"
-mqtt_password: "$MQTT_PASSWORD"
-EOF
+cat <<'HEREDOC_END' > "$VARS_FILE"
+target_user: "PLACEHOLDER_USER"
+tailscale_key: 'PLACEHOLDER_TS'
+cf_token: 'PLACEHOLDER_CF'
+ha_tz: 'PLACEHOLDER_TZ'
+ha_lat: "PLACEHOLDER_LAT"
+ha_lon: "PLACEHOLDER_LON"
+ha_elev: "PLACEHOLDER_ELEV"
+mqtt_password: "PLACEHOLDER_MQTT"
+HEREDOC_END
+sed -i \
+  -e "s|PLACEHOLDER_USER|$TARGET_USER|" \
+  -e "s|PLACEHOLDER_TS|$TS_KEY|" \
+  -e "s|PLACEHOLDER_CF|$CF_TOKEN|" \
+  -e "s|PLACEHOLDER_TZ|$HA_TZ|" \
+  -e "s|PLACEHOLDER_LAT|$HA_LAT|" \
+  -e "s|PLACEHOLDER_LON|$HA_LON|" \
+  -e "s|PLACEHOLDER_ELEV|$HA_ELEV|" \
+  -e "s|PLACEHOLDER_MQTT|$MQTT_PASSWORD|" \
+  "$VARS_FILE"
 chmod 600 "$VARS_FILE"
 
-# --- 4. Hand off to Ansible ---
+# --- 5. Hand off to Ansible ---
 echo -e "\n>>> Interview Complete. Handing control to Ansible...\n"
 
 # ✅ FIX #3: Fixed broken line continuation (-c loca\nl -> -c local)
@@ -121,8 +131,11 @@ echo ""
 echo "==========================================================="
 echo "   🔐 SAVE THESE CREDENTIALS"
 echo "==========================================================="
-echo "   MQTT Username : smarthome"
-echo "   MQTT Password : $MQTT_PASSWORD"
+echo "   MQTT Username   : smarthome"
+echo "   MQTT Password   : $MQTT_PASSWORD"
+echo ""
+echo "   Node-RED Login  : admin / $MQTT_PASSWORD"
+echo "   Zigbee2MQTT UI  : token = $MQTT_PASSWORD"
 echo ""
 echo "   These are already configured in your stack."
 echo "   Store them in a password manager — they will not be shown again."

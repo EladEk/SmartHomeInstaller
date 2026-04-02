@@ -7,9 +7,9 @@ A single-command installer that deploys a full smart-home stack on any Ubuntu se
 | Service | Port | Description |
 |---|---|---|
 | [Home Assistant](https://www.home-assistant.io/) | `8123` | Central automation hub |
-| [Zigbee2MQTT](https://www.zigbee2mqtt.io/) | `8080` | Zigbee device gateway |
-| [Node-RED](https://nodered.org/) | `1880` | Visual automation flows |
-| [Eclipse Mosquitto](https://mosquitto.org/) | `1883` | MQTT message broker |
+| [Zigbee2MQTT](https://www.zigbee2mqtt.io/) | `8080` | Zigbee device gateway (token-protected) |
+| [Node-RED](https://nodered.org/) | `1880` | Visual automation flows (password-protected) |
+| [Eclipse Mosquitto](https://mosquitto.org/) | `1883` | MQTT message broker (password auth) |
 
 ### Optional Networking
 
@@ -40,19 +40,31 @@ The setup wizard will walk you through:
 
 Once the interview is complete, Ansible takes over and handles everything else automatically.
 
+At the end, the installer prints all generated credentials — save them in a password manager.
+
 ## What the Installer Does
 
-1. Installs system dependencies and Ansible
-2. Adds the Docker CE repository and installs Docker + Compose plugin
+1. Installs system dependencies (including Ansible and OpenSSL)
+2. Adds the Docker CE repository, installs Docker + Compose plugin, and enables the service
 3. Installs and authenticates Tailscale (if a key was provided)
 4. Installs and enables Cloudflare Tunnel (if a token was provided)
 5. Auto-detects the Zigbee USB coordinator
 6. Scaffolds the `~/SmartHome` directory tree
 7. Generates all configuration files (Home Assistant, Mosquitto, Zigbee2MQTT)
-8. Creates a strong random MQTT password and configures password-based auth
+8. Creates a strong random password and configures password-based auth for MQTT, Node-RED, and Zigbee2MQTT
 9. Starts the full Docker Compose stack
 10. Initialises a Git repository for config version tracking
 11. Registers a nightly backup cron job (runs at 02:00)
+
+## Default Credentials
+
+All services share a single auto-generated 32-character password, displayed once at the end of setup:
+
+| Service | Username | Password |
+|---|---|---|
+| MQTT (Mosquitto) | `smarthome` | *(auto-generated)* |
+| Node-RED | `admin` | *(auto-generated)* |
+| Zigbee2MQTT UI | *(token auth)* | *(auto-generated)* |
 
 ## Directory Layout
 
@@ -72,12 +84,14 @@ After installation, `~/SmartHome` will look like this:
 ├── mosquitto/
 │   ├── config/
 │   │   ├── mosquitto.conf
-│   │   └── passwd
+│   │   ├── passwd
+│   │   └── mqtt_password
 │   ├── data/
 │   └── log/
 ├── zigbee2mqtt/
 │   └── configuration.yaml
 ├── nodered/
+│   └── settings.js
 ├── scripts/
 ├── system/
 ├── backup.sh
@@ -96,11 +110,13 @@ A nightly cron job at **02:00** runs `backup.sh`, which:
 
 ## Security Notes
 
-- MQTT broker uses **password authentication** — anonymous access is disabled
-- MQTT password is **auto-generated** (32-character hex) and never stored on disk after setup
-- Tailscale auth key is passed via environment variable, never visible in process listings
-- Ansible variables file is written with `chmod 600` and deleted on exit (even on failure)
-- Mosquitto password file is restricted to owner-only read (`0600`)
+- **MQTT broker** uses password authentication — anonymous access is disabled
+- **Node-RED** is protected with bcrypt-hashed admin credentials (`adminAuth`)
+- **Zigbee2MQTT** frontend requires a token to access
+- MQTT password is auto-generated (32-character hex) and the Ansible vars file is deleted on exit
+- Tailscale and Cloudflare tokens are passed via environment variables, never visible in process listings
+- Sensitive config files (`zigbee2mqtt/configuration.yaml`, `nodered/settings.js`, `mosquitto/config/passwd`, `mosquitto/config/mqtt_password`) are excluded from Git via `.gitignore`
+- `secrets.yaml` is restricted to owner-only read (`0600`)
 
 ## Files
 
@@ -119,6 +135,9 @@ Log out and back in after installation so the Docker group membership takes effe
 
 **Services not starting:**
 Check container logs with `docker compose -f ~/SmartHome/ha-stack/docker-compose.yaml logs`.
+
+**Node-RED login not working:**
+The password is bcrypt-hashed in `~/SmartHome/nodered/settings.js`. If you lost the password, re-run `setup.sh` to regenerate.
 
 ## License
 
