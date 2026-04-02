@@ -23,6 +23,13 @@ echo "   Initiating SmartHome Genesis Sequence"
 echo "==========================================================="
 echo "Target User: $TARGET_USER"
 
+# ---- Load .env if present (pre-fill secrets, skip prompts) ----
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+    set -a; . "$ENV_FILE"; set +a
+    echo "Loaded secrets from .env"
+fi
+
 # --- 1. Install Ansible (Prerequisite) ---
 echo -e "\n>>> Installing Ansible Engine..."
 apt-get update -yqq
@@ -48,50 +55,71 @@ validate_int() {
   fi
 }
 
-# --- 2. The Interview ---
-echo ""
-echo "==========================================================="
-echo "   STEP 1: TAILSCALE VPN AUTHENTICATION"
-echo "==========================================================="
-echo "Tailscale securely connects your phone to the server."
-echo "1. Go to: https://login.tailscale.com/admin/settings/keys"
-echo "2. Click 'Generate auth key' (Reusable, Ephemeral = OFF)"
-read -rp "Paste Auth Key (or press enter to skip): " TS_KEY
+# --- 2. The Interview (skips prompts for values already in .env) ---
 
-echo -e "\n==========================================================="
-echo "   STEP 2: CLOUDFLARE TUNNEL"
-echo "==========================================================="
-echo "Cloudflare exposes Home Assistant securely to the web."
-echo "1. Go to Zero Trust Dashboard -> Networks -> Tunnels"
-echo "2. Create a tunnel, copy the token from the install command."
-read -rp "Paste Tunnel Token (or press enter to skip): " CF_TOKEN
-
-echo -e "\n==========================================================="
-echo "   STEP 3: HOME ASSISTANT LOCATION DATA"
-echo "==========================================================="
-echo "Home Assistant needs your exact coordinates for sun/weather automations."
-echo "You can find these at https://www.latlong.net/"
-
-read -rp "Enter Timezone (e.g., Asia/Jerusalem): " HA_TZ
-if [[ -z "$HA_TZ" ]]; then
-  echo "❌ Timezone cannot be empty."
-  exit 1
+TS_KEY="${TAILSCALE_KEY:-}"
+if [ -z "$TS_KEY" ]; then
+    echo ""
+    echo "==========================================================="
+    echo "   STEP 1: TAILSCALE VPN AUTHENTICATION"
+    echo "==========================================================="
+    echo "Tailscale securely connects your phone to the server."
+    echo "1. Go to: https://login.tailscale.com/admin/settings/keys"
+    echo "2. Click 'Generate auth key' (Reusable, Ephemeral = OFF)"
+    read -rp "Paste Auth Key (or press enter to skip): " TS_KEY
+else
+    echo "Tailscale key loaded from .env"
 fi
 
-read -rp "Enter Latitude (e.g., 31.2529): " HA_LAT
-validate_float "$HA_LAT" "Latitude"
+CF_TOKEN="${CF_TOKEN:-}"
+if [ -z "$CF_TOKEN" ]; then
+    echo -e "\n==========================================================="
+    echo "   STEP 2: CLOUDFLARE TUNNEL"
+    echo "==========================================================="
+    echo "Cloudflare exposes Home Assistant securely to the web."
+    echo "1. Go to Zero Trust Dashboard -> Networks -> Tunnels"
+    echo "2. Create a tunnel, copy the token from the install command."
+    read -rp "Paste Tunnel Token (or press enter to skip): " CF_TOKEN
+else
+    echo "Cloudflare token loaded from .env"
+fi
 
-read -rp "Enter Longitude (e.g., 34.7914): " HA_LON
-validate_float "$HA_LON" "Longitude"
+HA_TZ="${HA_TIMEZONE:-}"
+HA_LAT="${HA_LATITUDE:-}"
+HA_LON="${HA_LONGITUDE:-}"
+HA_ELEV="${HA_ELEVATION:-}"
 
-read -rp "Enter Elevation in meters (e.g., 260): " HA_ELEV
-validate_int "$HA_ELEV" "Elevation"
+if [ -z "$HA_TZ" ] || [ -z "$HA_LAT" ] || [ -z "$HA_LON" ] || [ -z "$HA_ELEV" ]; then
+    echo -e "\n==========================================================="
+    echo "   STEP 3: HOME ASSISTANT LOCATION DATA"
+    echo "==========================================================="
+    echo "Home Assistant needs your exact coordinates for sun/weather automations."
+    echo "You can find these at https://www.latlong.net/"
 
-# --- 3. Auto-Generate MQTT Password ---
-# Never trust the user to change a default — generate a strong password automatically.
-# hex output is purely alphanumeric with no +/= symbols, so no stripping needed.
-# 'openssl rand -hex 16' always produces exactly 32 characters.
-MQTT_PASSWORD="$(openssl rand -hex 16)"
+    [ -z "$HA_TZ" ] && read -rp "Enter Timezone (e.g., Asia/Jerusalem): " HA_TZ
+    if [[ -z "$HA_TZ" ]]; then
+      echo "Timezone cannot be empty."
+      exit 1
+    fi
+
+    [ -z "$HA_LAT" ] && read -rp "Enter Latitude (e.g., 31.2529): " HA_LAT
+    validate_float "$HA_LAT" "Latitude"
+
+    [ -z "$HA_LON" ] && read -rp "Enter Longitude (e.g., 34.7914): " HA_LON
+    validate_float "$HA_LON" "Longitude"
+
+    [ -z "$HA_ELEV" ] && read -rp "Enter Elevation in meters (e.g., 260): " HA_ELEV
+    validate_int "$HA_ELEV" "Elevation"
+else
+    echo "Location data loaded from .env"
+    validate_float "$HA_LAT" "Latitude"
+    validate_float "$HA_LON" "Longitude"
+    validate_int "$HA_ELEV" "Elevation"
+fi
+
+# --- 3. MQTT Password (from .env or auto-generated) ---
+MQTT_PASSWORD="${MQTT_PASSWORD:-$(openssl rand -hex 16)}"
+echo "MQTT password: ${MQTT_PASSWORD:+set}"
 
 # --- 4. Generate Ansible Variables File ---
 echo ">>> Securing variables..."
